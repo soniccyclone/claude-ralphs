@@ -1,60 +1,64 @@
 # claude-ralph
 
-A containerized [ralph loop](https://ghuntley.com/ralph/) for Claude Code, with **pluggable, externally-verified success criteria**. Drop in a spec, drop in a verifier, run `claude-ralph up`, walk away.
+A [ralph loop](https://ghuntley.com/ralph/) runner for Claude Code, with **pluggable, externally-verified success criteria**. Drop in a spec, drop in a verifier, run `claude-ralph`, walk away.
 
 > **What's a ralph loop?** `while :; do cat PROMPT.md | claude-code; done`, basically. You hand the agent a goal and a punch list, it iterates, you watch. The hard part isn't the loop — it's knowing when to stop and what "done" actually means. See Huntley's [original](https://ghuntley.com/loop/) and [follow-up](https://ghuntley.com/ralph/).
 
 ## Why this exists
 
-The canonical ralph loop has two weaknesses:
+The canonical ralph loop has one critical weakness: **"done" is whatever the LLM says it is.** The model writes `DONE` to a sentinel file when it *thinks* it's done. That's a hallucination away from a green light on red code.
 
-1. **It runs on your laptop.** `rm -rf` is one bad iteration away. People work around this with `--dangerously-skip-permissions`, white-knuckled. We just put it in a container.
-2. **"Done" is whatever the LLM says it is.** The model writes `DONE` to a sentinel file when it *thinks* it's done. That's a hallucination away from a green light on red code. We replace self-report with **external verifiers** — exit-code-driven scripts that run after every iteration and gate the loop.
+`claude-ralph` replaces self-report with **external verifiers** — exit-code-driven scripts that run after every iteration and gate the loop. The agent doesn't decide it's done; your test suite does. Or your typechecker. Or a Playwright script. Or Chrome DevTools MCP eyeballing the rendered page. Or all four.
 
-That second point is the whole pitch. The agent doesn't decide it's done; your test suite does. Or your typechecker. Or a Playwright script. Or Chrome DevTools MCP eyeballing the rendered page. Or all four.
+That's the whole pitch. The tool itself is small, foreground, Unix-y — one process, one loop, ^C to stop. **Sandboxing is your call.** Run it on your laptop, in a devcontainer, in a VM, in a Codespace, behind `firejail` — `claude-ralph` doesn't care. We recommend you don't run unbounded `claude` on a host you'd cry over, but the tool isn't going to hold your hand about it. See [Sandboxing recommendations](#sandboxing-recommendations) below.
 
 ## How it works
 
 ```mermaid
-flowchart LR
-    workspace[(workspace<br/>+ .ralph/)]
+flowchart TB
+    prompt["1. claude &lt; PROMPT.md"]
+    verify["2. run verifiers/*"]
+    gate{"3. all green?"}
+    report["write verifier_report.md"]
+    done(["write DONE, exit"])
 
-    subgraph host["claude-ralph host"]
-        subgraph container["container (per project)"]
-            direction TB
-            prompt["1. claude &lt; PROMPT.md"]
-            verify["2. run verifiers/*"]
-            gate{"3. all green?"}
-            report["write verifier_report.md"]
-            done(["write DONE, exit"])
-
-            prompt --> verify --> gate
-            gate -- yes --> done
-            gate -- no --> report --> prompt
-        end
-    end
-
-    workspace <--> container
+    prompt --> verify --> gate
+    gate -- yes --> done
+    gate -- no --> report --> prompt
 ```
 
 Each iteration:
 
 1. Compose a prompt from `PROMPT.md` + `specs/` + `fix_plan.md` + the previous iteration's `verifier_report.md`.
-2. Pipe it to `claude` inside the container. The agent edits files, runs commands, updates `fix_plan.md`.
+2. Pipe it to `claude`. The agent edits files, runs commands, updates `fix_plan.md`.
 3. Run every executable in `.ralph/verifiers/` in lexical order. Capture stdout/stderr and exit codes.
-4. **All exit 0** → write `.ralph/DONE`, stop the loop, you get a notification. **Anything nonzero** → write a fresh `verifier_report.md` summarizing failures, loop.
+4. **All exit 0** → write `.ralph/DONE`, exit cleanly. **Anything nonzero** → write a fresh `verifier_report.md` summarizing failures, loop.
 
 The verifier report is the feedback signal. The agent reads it next iteration and reacts.
 
 ## Install
 
 ```bash
-git clone https://github.com/nbarlow/claude-ralphs ~/code/claude-ralph
-cd ~/code/claude-ralph
-make install                # symlinks `claude-ralph` into ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/nbarlow/claude-ralphs/main/install.sh | bash
 ```
 
-Requires: Docker (or Podman), `bash`, `make`. The container image is built on first `claude-ralph up` and cached.
+Drops `claude-ralph` into `~/.local/bin/`. Warns if that's not on your `$PATH`.
+
+### From source
+
+Clone the repo, then:
+
+```bash
+make install                # symlinks bin/claude-ralph into ~/.local/bin (override with PREFIX=...)
+```
+
+Other targets: `make test`, `make check`, `make uninstall`, `make help`. `make` is only needed if you're building from source — the installed CLI itself doesn't depend on it.
+
+### Requirements
+
+- The `claude` CLI on `PATH` ([install instructions](https://docs.anthropic.com/en/docs/claude-code/quickstart))
+- `ANTHROPIC_API_KEY` in your environment (or whatever auth `claude` is set up for)
+- `bash` (you have it)
 
 ## Quick start
 
@@ -65,17 +69,10 @@ claude-ralph init           # scaffolds .ralph/ — PROMPT.md, specs/, verifiers
 $EDITOR .ralph/PROMPT.md    # state the goal
 $EDITOR .ralph/specs/001-*.md
 chmod +x .ralph/verifiers/01-tests.sh   # already scaffolded; edit to taste
-claude-ralph up             # build container, start looping
+claude-ralph                # start looping. ^C to stop.
 ```
 
-In another terminal:
-
-```bash
-claude-ralph logs -f        # follow what the agent is doing
-claude-ralph status         # iteration count, last verifier results, est. token spend
-claude-ralph stop           # graceful: finish current iteration then exit
-claude-ralph kill           # ungraceful: SIGTERM the container now
-```
+It's a foreground process. Background it with `&`, `nohup`, `tmux`, `systemd-run --user`, or whatever you'd reach for normally. Tail per-iteration logs with `tail -f .ralph/iterations/*/stdout.log`.
 
 ## The `.ralph/` layout
 
@@ -88,7 +85,7 @@ claude-ralph kill           # ungraceful: SIGTERM the container now
 | `verifiers/NN-*.sh` | you | Success criteria. Exit 0 = pass. Lexical run order. |
 | `verifier_report.md` | ralph | Last run's results. Read by the agent next iteration. |
 | `iterations/NNNN/` | ralph | Full history per iteration: `prompt.txt`, `stdout.log`, `stderr.log`, `verifiers.json`. |
-| `config.toml` | you | Loop / container / claude knobs. Optional. |
+| `config.toml` | you | Loop / claude knobs. Optional. |
 | `DONE` | ralph | Sentinel — written when all verifiers pass. Loop exits. |
 
 ## Verifiers: the plugin contract
@@ -97,7 +94,7 @@ claude-ralph kill           # ungraceful: SIGTERM the container now
 
 A verifier is any executable in `.ralph/verifiers/`. It:
 
-- Runs from the workspace root, inside the container.
+- Runs from the workspace root, in the same environment as the agent.
 - Exits **0** if its criterion is satisfied, **nonzero** otherwise.
 - Writes human-readable diagnostic output to stdout/stderr — this gets fed back to the agent.
 
@@ -174,40 +171,41 @@ This is parsed best-effort. No metadata is also fine — the contract is still j
 [loop]
 max_iterations = 50          # hard stop. default 50. --unlimited overrides.
 max_cost_usd = 25.00         # halts loop when accumulated API spend exceeds.
-on_done = "notify"           # "notify" | "shutdown" | "open-pr"
-
-[container]
-image = "claude-ralph:latest"   # override with your own Dockerfile
-extra_mounts = ["~/.gitconfig:/root/.gitconfig:ro"]
-env_passthrough = ["GITHUB_TOKEN", "OPENAI_API_KEY"]
+on_done = "notify"           # "notify" | "exit" | "open-pr"
 
 [claude]
 model = "claude-opus-4-7"
 allowed_tools = ["Bash", "Edit", "Write", "Read"]   # passed to claude
 mcp_config = ".ralph/mcp.json"
+extra_args = ["--dangerously-skip-permissions"]     # if you know what you're doing
 ```
-
-## Container
-
-Default image: bash, git, node, python, ripgrep, jq, the `claude` CLI, and Playwright with Chromium. Workspace is bind-mounted at `/workspace`. `ANTHROPIC_API_KEY` passes through from the host.
-
-Override by dropping a `.ralph/Dockerfile` in your project — `claude-ralph up` will detect and use it. `FROM claude-ralph:base` to extend.
 
 ## Subcommands
 
 | command | does |
 |---|---|
+| (no args) | start the loop in the foreground; ^C to stop |
 | `init` | scaffold `.ralph/` |
-| `up` | build container, start loop, attach |
-| `up -d` | same, detached |
-| `logs [-f]` | tail the running loop |
-| `status` | iteration count, last verifier results, token spend |
 | `verify` | run verifiers once against current state, no loop |
-| `step` | run one iteration, then stop |
-| `stop` | graceful stop after current iteration |
-| `kill` | SIGTERM now |
+| `step` | run one iteration, then exit |
+| `status` | iteration count, last verifier results, token spend |
 | `clean` | remove `.ralph/iterations/` and `DONE` |
-| `shell` | exec a bash shell into the container for debugging |
+
+That's the whole surface. Backgrounding, log following, killing — those are jobs your shell already does.
+
+## Sandboxing recommendations
+
+`claude-ralph` itself does nothing to constrain what the agent can do. The agent has whatever permissions the shell that launched `claude-ralph` has. If you point it at your `$HOME` and tell it to "fix the bugs," it can do anything you can do.
+
+Pick whatever isolation matches your appetite:
+
+- **Devcontainer / VS Code Dev Containers** — easiest if you already use them. Mount the project, set `ANTHROPIC_API_KEY`, run `claude-ralph` inside.
+- **Docker / Podman** — `docker run --rm -it -v $PWD:/work -w /work -e ANTHROPIC_API_KEY <your-image> claude-ralph`. Build an image with `claude` + your project's toolchain.
+- **GitHub Codespaces / cloud dev env** — disposable and remote. Probably the lowest-stakes option.
+- **VM** — overkill for most cases, right for some.
+- **Bare host** — fine for small, scoped tasks where you've read `PROMPT.md` and the verifiers carefully. Not the default we'd recommend for "leave it running overnight."
+
+The verifiers run in the same environment as the loop, so they get whatever toolchain you've set up. That's the point — you don't have to tell `claude-ralph` about your stack.
 
 ## Tuning the prompt
 
@@ -217,8 +215,10 @@ The default `PROMPT.md` follows Huntley's structure: study the specs, work the p
 
 ## What's deliberately *not* in scope
 
-- **No GUI / web dashboard.** `logs -f` and a tmux pane are enough.
-- **No remote orchestration.** This runs one loop on one host against one repo. If you want a fleet, wrap it.
+- **No container management.** `claude-ralph` is a CLI; sandboxing is your call. See above.
+- **No daemon / service mode.** Foreground process. `tmux`, `nohup`, and `systemd-run --user` exist.
+- **No GUI / web dashboard.** `tail -f`, `less`, and a terminal are enough.
+- **No remote orchestration.** One loop, one host, one repo. If you want a fleet, wrap it.
 - **No model-agnostic abstraction.** This is for Claude Code. The loop pattern is universal but the prompt format and tool wiring aren't.
 - **No verifier marketplace.** They're 10 lines of bash. Write yours.
 
@@ -236,7 +236,7 @@ These are flagged for discussion before/during implementation, not decided:
 
 - [ghuntley/loop](https://ghuntley.com/loop/) — the original technique.
 - [exokomodo/im-gonna-ralph](https://github.com/exokomodo/im-gonna-ralph) — bash implementation atop GitHub Copilot CLI, with iteration history and SDD spec splitting. We borrow the iteration-dir pattern.
-- This project differs by: (a) Claude Code instead of Copilot, (b) container-first, (c) external verifier gating instead of self-report DONE.
+- This project differs by: (a) Claude Code instead of Copilot, (b) external verifier gating instead of self-report DONE.
 
 ## License
 
