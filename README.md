@@ -38,11 +38,39 @@ The verifier report is the feedback signal. The agent reads it next iteration an
 
 ## Install
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/nbarlow/claude-ralphs/main/install.sh | bash
+With curl:
+
+```sh
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/nbarlow/claude-ralphs/main/install.sh)"
 ```
 
-Drops `claude-ralph` into `~/.local/bin/`. Warns if that's not on your `$PATH`.
+Or wget:
+
+```sh
+sh -c "$(wget -qO- https://raw.githubusercontent.com/nbarlow/claude-ralphs/main/install.sh)"
+```
+
+Works from bash, zsh, fish, dash, or any POSIX shell — the outer `sh -c` spawns its own POSIX shell, so your interactive shell doesn't matter. The installer is POSIX `sh` itself (no bashisms) so it runs on Alpine, BusyBox, and macOS's stock `/bin/sh`.
+
+We use `sh -c "$(... )"` instead of `... | sh` so the script is downloaded **completely** before any of it executes — a flaky connection produces a parse error, not a half-installed system. Same pattern Homebrew and oh-my-zsh use.
+
+What it does:
+
+- Drops `claude-ralph` into `~/.local/bin/` (override with `PREFIX=/usr/local`, will prompt for sudo if needed).
+- Detects your login shell (`bash`, `zsh`, `fish`) and prints the exact one-liner to add `~/.local/bin` to `$PATH` if it isn't already. Doesn't edit your rc files without consent.
+- Verifies `claude` is on `$PATH` and `ANTHROPIC_API_KEY` is set; warns but doesn't fail if not.
+
+Pin a version with `VERSION=v0.2.0 curl ... | sh`, or run `claude-ralph self-update` later.
+
+### Windows
+
+PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/nbarlow/claude-ralphs/main/install.ps1 | iex
+```
+
+Or use WSL with the POSIX installer above. `claude-ralph` is bash; native Windows isn't a target.
 
 ### From source
 
