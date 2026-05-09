@@ -1,6 +1,6 @@
 # claude-ralph
 
-A [ralph loop](https://ghuntley.com/ralph/) runner for Claude Code, with **pluggable, externally-verified success criteria**. Drop in a spec, drop in a verifier, run `claude-ralph`, walk away.
+A [ralph loop](https://ghuntley.com/ralph/) runner for Claude Code, with **externally-verified success criteria** — scripts you write, that exit 0 when the work is done. Drop in a spec, drop in a verifier, run `claude-ralph`, watch the first few iterations and tune the prompt.
 
 > **What's a ralph loop?** `while :; do cat PROMPT.md | claude-code; done`, basically. You hand the agent a goal and a punch list, it iterates, you watch. The hard part isn't the loop — it's knowing when to stop and what "done" actually means. See Huntley's [original](https://ghuntley.com/loop/) and [follow-up](https://ghuntley.com/ralph/).
 
@@ -16,7 +16,7 @@ That's the whole pitch. The tool itself is small, foreground, Unix-y — one pro
 
 ```mermaid
 flowchart TB
-    prompt["1. claude &lt; PROMPT.md"]
+    prompt["1. run claude with composed prompt"]
     verify["2. run verifiers/*"]
     gate{"3. all green?"}
     report["write verifier_report.md"]
@@ -60,17 +60,11 @@ What it does:
 - Detects your login shell (`bash`, `zsh`, `fish`) and prints the exact one-liner to add `~/.local/bin` to `$PATH` if it isn't already. Doesn't edit your rc files without consent.
 - Verifies `claude` is on `$PATH` and `ANTHROPIC_API_KEY` is set; warns but doesn't fail if not.
 
-Pin a version with `VERSION=v0.2.0 curl ... | sh`, or run `claude-ralph self-update` later.
+To upgrade, re-run the installer. To pin or roll back, install from source at the tag you want.
 
 ### Windows
 
-PowerShell:
-
-```powershell
-irm https://raw.githubusercontent.com/nbarlow/claude-ralphs/main/install.ps1 | iex
-```
-
-Or use WSL with the POSIX installer above. `claude-ralph` is bash; native Windows isn't a target.
+Use WSL with the POSIX installer above. `claude-ralph` is bash; native Windows isn't a target.
 
 ### From source
 
@@ -148,34 +142,30 @@ set -euo pipefail
 npx tsc --noEmit
 ```
 
-**Visual check via Chrome DevTools MCP:**
+**End-to-end UI check (Playwright, headless):**
 
 ```bash
 #!/usr/bin/env bash
-# .ralph/verifiers/03-rendered-ok.sh
-# Spawns the dev server, asks claude (one-shot, no loop) to load the page
-# via chrome-devtools-mcp and report whether the feature looks right.
-# Exits 0 if claude reports OK.
+# .ralph/verifiers/03-e2e.sh
 set -euo pipefail
 npm run dev &>/dev/null &
-SERVER_PID=$!
-trap "kill $SERVER_PID" EXIT
+trap "kill $!" EXIT
+until curl -fsS http://localhost:3000 >/dev/null; do sleep 0.2; done
 
-claude --print --mcp-config .ralph/mcp/chrome.json <<'EOF' | grep -q '^OK$'
-Load http://localhost:3000/checkout. The "Apply coupon" button should be visible
-and enabled. Print exactly "OK" if so, otherwise print "FAIL: <reason>".
-EOF
+npx playwright test e2e/checkout-coupon.spec.ts
 ```
 
-**Grafana SLO not regressed:**
+**Binary size budget:**
 
 ```bash
 #!/usr/bin/env bash
-# .ralph/verifiers/04-slo.sh
+# .ralph/verifiers/04-size.sh
 set -euo pipefail
-ERR_RATE=$(curl -sf "https://grafana.internal/api/.../checkout-error-rate" | jq -r '.data')
-awk -v r="$ERR_RATE" 'BEGIN { exit (r < 0.01) ? 0 : 1 }'
+go build -o /tmp/myapp ./cmd/myapp
+test "$(stat -c%s /tmp/myapp)" -lt $((20 * 1024 * 1024))    # 20MB ceiling
 ```
+
+**On using `claude` itself as a verifier.** You *can* spawn `claude --print` from inside a verifier — pointing it at Chrome DevTools MCP for visual checks, for instance. Reach for it only when no deterministic check exists. It's slow, expensive, non-deterministic, and asking an LLM whether the LLM did its job is exactly the self-report problem this tool exists to fix. Playwright with a screenshot diff is almost always the right answer first.
 
 ### Optional metadata
 
@@ -186,10 +176,11 @@ A header comment block lets ralph render nicer reports and treat some verifiers 
 # ralph: name = "frontend tests"
 # ralph: blocking = false              # default true; false = report but don't gate DONE
 # ralph: timeout = 5m                  # default unlimited
-# ralph: rerun-on-failure = 3          # flake tolerance
 ```
 
 This is parsed best-effort. No metadata is also fine — the contract is still just exit code.
+
+**On flakes.** ralph will not retry, quarantine, or score-track flaky verifiers. A flake is a bug in the verifier (or in the thing it's testing). Fix it. Flake-tolerance is how test suites rot into uselessness.
 
 ## Configuration
 
@@ -198,15 +189,15 @@ This is parsed best-effort. No metadata is also fine — the contract is still j
 ```toml
 [loop]
 max_iterations = 50          # hard stop. default 50. --unlimited overrides.
-max_cost_usd = 25.00         # halts loop when accumulated API spend exceeds.
-on_done = "notify"           # "notify" | "exit" | "open-pr"
+on_done = "notify"           # "notify" | "exit"
 
 [claude]
 model = "claude-opus-4-7"
-allowed_tools = ["Bash", "Edit", "Write", "Read"]   # passed to claude
 mcp_config = ".ralph/mcp.json"
 extra_args = ["--dangerously-skip-permissions"]     # if you know what you're doing
 ```
+
+`max_iterations` is the hammer for runaway cost — calculate before launching, set the ceiling, walk away from theatrical FinOps dashboards. If you want to push to a branch when the loop succeeds, write a final verifier that does `git push` and `gh pr create`. ralph stays dumb.
 
 ## Subcommands
 
@@ -227,11 +218,11 @@ That's the whole surface. Backgrounding, log following, killing — those are jo
 
 Pick whatever isolation matches your appetite:
 
-- **Devcontainer / VS Code Dev Containers** — easiest if you already use them. Mount the project, set `ANTHROPIC_API_KEY`, run `claude-ralph` inside.
-- **Docker / Podman** — `docker run --rm -it -v $PWD:/work -w /work -e ANTHROPIC_API_KEY <your-image> claude-ralph`. Build an image with `claude` + your project's toolchain.
-- **GitHub Codespaces / cloud dev env** — disposable and remote. Probably the lowest-stakes option.
-- **VM** — overkill for most cases, right for some.
-- **Bare host** — fine for small, scoped tasks where you've read `PROMPT.md` and the verifiers carefully. Not the default we'd recommend for "leave it running overnight."
+- **Docker / Podman** — the straightforward answer. `docker run --rm -it -v "$PWD:/work" -w /work -e ANTHROPIC_API_KEY <your-image> claude-ralph`. Build an image with `claude` plus your project's toolchain.
+- **VM** — heavier than a container, sometimes the right tool. Vagrant, libvirt, whatever you already have.
+- **`firejail` / `bubblewrap`** — namespace-only sandboxing if you don't want a full container. Lighter, fiddlier.
+- **Devcontainer** — if you already live in VS Code Dev Containers, this just wraps the Docker case.
+- **Bare host** — fine for small, scoped tasks where you've read `PROMPT.md` and the verifiers carefully. Not the default for "leave it running overnight."
 
 The verifiers run in the same environment as the loop, so they get whatever toolchain you've set up. That's the point — you don't have to tell `claude-ralph` about your stack.
 
@@ -248,23 +239,22 @@ The default `PROMPT.md` follows Huntley's structure: study the specs, work the p
 - **No GUI / web dashboard.** `tail -f`, `less`, and a terminal are enough.
 - **No remote orchestration.** One loop, one host, one repo. If you want a fleet, wrap it.
 - **No model-agnostic abstraction.** This is for Claude Code. The loop pattern is universal but the prompt format and tool wiring aren't.
+- **No self-update.** `git pull && make install`, or re-run the curl installer. CLIs that update themselves are a Vercel-era flourish.
+- **No cost dashboard / FinOps tracking.** Set `max_iterations`, calculate before launching.
+- **No flake quarantine.** Fix your flakes.
+- **No auto-spec generation.** Write your specs. An LLM splitting a task file into specs is another hallucination vector for marginal benefit.
+- **No PR / branch automation.** A final verifier doing `git push && gh pr create` is the right place for that.
 - **No verifier marketplace.** They're 10 lines of bash. Write yours.
 
-## Open design questions
+## Multiple loops on one repo
 
-These are flagged for discussion before/during implementation, not decided:
-
-1. **Verifier flake handling.** `rerun-on-failure = N` in metadata is a starting point but real flakes need more — quarantine? per-verifier success-rate tracking? Or punt and tell users to fix their flakes.
-2. **Cost accounting.** `claude` CLI doesn't (yet?) expose per-call token counts in a stable way. We may need to scrape stderr or make users set `max_iterations` and call it a day.
-3. **Auto-spec generation.** Exokomodo's ralph splits a flat task file into specs via a one-shot LLM call. Useful, but it's another place hallucinations enter. Default off; opt in via `claude-ralph plan`.
-4. **Branch / PR workflow.** Should `on_done = "open-pr"` be first-class? Or keep ralph dumb and let users wire it via a final verifier that does the push?
-5. **Multiple loops, one repo.** `.ralph/` per worktree is probably the answer, but worth confirming.
+`.ralph/` is per-worktree, like `.git/`. Run multiple loops by checking out multiple `git worktree` directories — one per concurrent goal. Don't try to run two loops against the same working tree; they'll fight over `fix_plan.md` and the iteration counter.
 
 ## Prior art
 
 - [ghuntley/loop](https://ghuntley.com/loop/) — the original technique.
 - [exokomodo/im-gonna-ralph](https://github.com/exokomodo/im-gonna-ralph) — bash implementation atop GitHub Copilot CLI, with iteration history and SDD spec splitting. We borrow the iteration-dir pattern.
-- This project differs by: (a) Claude Code instead of Copilot, (b) external verifier gating instead of self-report DONE.
+- This project differs by: (a) Claude Code instead of Copilot, (b) external verifier gating instead of self-reported DONE.
 
 ## License
 
